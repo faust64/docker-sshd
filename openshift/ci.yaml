@@ -1,0 +1,269 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: sshd
+  template: sshd-jenkins-pipeline
+metadata:
+  annotations:
+    description: SSHD - Jenkinsfile
+      see https://github.com/faust64/docker-sshd
+    iconClass: icon-openshift
+    openshift.io/display-name: SSHD CI
+    tags: sshd
+  name: sshd-jenkins-pipeline
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Tests SSHD images
+    name: sshd-jenkins-pipeline
+  spec:
+    strategy:
+      jenkinsPipelineStrategy:
+        jenkinsfile: |-
+          def frontName    = 'cissh'
+          def gitCommitMsg = ''
+          def templateMark = 'ssh-jenkins-ci'
+          def templateSel  = 'jenkins-ci-mark'
+          pipeline {
+              agent {
+                  node { label 'maven' }
+              }
+              options { timeout(time: 95, unit: 'MINUTES') }
+              parameters {
+                  string(defaultValue: '3', description: 'Max Retry', name: 'jobMaxRetry')
+                  string(defaultValue: '1', description: 'Retry Count', name: 'jobRetryCount')
+                  string(defaultValue: 'master', description: 'SSHD Docker Image - Source Git Branch', name: 'sshdBranch')
+                  string(defaultValue: 'master', description: 'SSHD Docker Image - Source Git Hash', name: 'sshdHash')
+                  string(defaultValue: '${GIT_SOURCE_HOST}/faust64/docker-sshd.git', description: 'SSHD Docker Image - Source Git Repository', name: 'sshdRepo')
+              }
+              stages {
+                  stage('pre-cleanup') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      echo "Using project: ${openshift.project()}"
+                                      echo "cleaning up previous assets for sshd-${frontName}-${params.sshdHash}"
+                                      openshift.selector("buildconfigs", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                      openshift.selector("deploymentconfigs", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                      openshift.selector("configmaps", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                      openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('create') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      def namespace = "${openshift.project()}"
+                                      try {
+                                          timeout(10) {
+                                              def cloneProto = "http"
+                                              def created
+                                              def objectsFromTemplate
+                                              def privateRepo = false
+                                              def repoHost = params.sshdRepo.split('/')[0]
+                                              def templatePath = "/tmp/workspace/${namespace}/${namespace}-sshd-jenkins-pipeline/tmpsshd${params.sshdBranch}/openshift"
+                                              sh "git config --global http.sslVerify false"
+                                              sh "rm -fr tmpsshd${params.sshdBranch}; mkdir -p tmpsshd${params.sshdBranch}"
+                                              dir ("tmpsshd${params.sshdBranch}") {
+                                                  try {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          cloneProto = "https"
+                                                          privateRepo = true
+                                                          echo "cloning ${params.sshdRepo} over https, using ${repoHost} token"
+                                                          try { git([ branch: "${params.sshdBranch}", url: "https://${GIT_TOKEN}@${params.sshdRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.sshdRepo}#${params.sshdBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      }
+                                                  } catch(e) {
+                                                      if (privateRepo != true) {
+                                                          echo "caught ${e} - assuming no credentials required"
+                                                          echo "cloning ${params.sshdRepo} over http"
+                                                          try { git([ branch: "${params.sshdBranch}", url: "http://${params.sshdRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.sshdRepo}#${params.sshdBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      } else { throw e }
+                                                  }
+                                                  try {
+                                                      gitCommitMsg = sh(returnStdout: true, script: "git log -n 1").trim()
+                                                  } catch(e) { echo "In non-critical catch block resolving commit message - ${e}" }
+                                              }
+                                              try { sh "test -d ${templatePath}" }
+                                              catch (e) {
+                                                  echo "Could not find ./openshift in ${params.sshdRepo}#${params.sshdBranch}"
+                                                  throw e
+                                              }
+                                              echo "Processing SSHD:${params.sshdHash}, from ${repoHost}, tagging to ${params.sshdBranch}"
+                                              try {
+                                                  echo " == Creating ImageStream =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/imagestream.yaml")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating ImageStream - ${e}" }
+                                              try {
+                                                  echo " == Creating BuildConfigs =="
+                                                  if (privateRepo) {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          objectsFromTemplate = openshift.process("-f", "${templatePath}/build-with-secret.yaml", '-p', "GIT_DEPLOYMENT_TOKEN=${GIT_TOKEN}",
+                                                              '-p', "SSHD_REPOSITORY_REF=${params.sshdHash}", '-p', "SSHD_REPOSITORY_URL=${cloneProto}://${params.sshdRepo}")
+                                                      }
+                                                  } else {
+                                                      objectsFromTemplate = openshift.process("-f", "${templatePath}/build.yaml",
+                                                          '-p', "SSHD_REPOSITORY_REF=${params.sshdHash}", '-p', "SSHD_REPOSITORY_URL=${cloneProto}://${params.sshdRepo}")
+                                                  }
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.sshdHash}" }
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating BuildConfigs - ${e}" }
+                                              echo " == Creating Demo =="
+                                              objectsFromTemplate = openshift.process("-f", "${templatePath}/run-ephemeral.yaml", '-p', "SSHD_IMAGE_TAG=${params.sshdHash}")
+                                              echo "The template will create ${objectsFromTemplate.size()} objects"
+                                              for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.sshdHash}" }
+                                              created = openshift.create(objectsFromTemplate)
+                                              created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while creating resources - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('build') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(25) {
+                                              echo "watching sshd-${params.sshdHash} docker image build"
+                                              def builds = openshift.selector("bc", [ name: "sshd-${params.sshdHash}" ]).related('builds')
+                                              builds.untilEach(1) { return (it.object().status.phase == "Complete") }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while building Docker image - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('deploy') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(10) {
+                                              def namespace = "${openshift.project()}"
+                                              try {
+                                                  sh """
+                                                  oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                  oc describe -n ${namespace} imagestreamtag sshd:${params.sshdHash} || exit 1
+                                                  """
+                                              } catch(e) {
+                                                  echo "In catch block while looking for SSHD image - ${e}"
+                                                  throw e
+                                              }
+                                              retry(2) {
+                                                  echo "watching sshd-${frontName}-${params.sshdHash} deployment rollout"
+                                                  def dc = openshift.selector("dc", [ name: "sshd-${frontName}-${params.sshdHash}" ]).related('pods')
+                                                  dc.untilEach(1) { return (it.object().status.phase == "Running") }
+                                              }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while deploying - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('tag') {
+                      steps {
+                          script {
+                              if ("${params.sshdBranch}" == "${params.sshdHash}") { echo "skipping tag - source matches target" }
+                              else {
+                                  openshift.withCluster() {
+                                      openshift.withProject() {
+                                          try {
+                                              timeout(5) {
+                                                  def namespace = "${openshift.project()}"
+                                                  retry(3) {
+                                                      sh """
+                                                      oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                      oc tag -n ${namespace} sshd:${params.sshdHash} sshd:${params.sshdBranch}
+                                                      """
+                                                  }
+                                              }
+                                          } catch(e) {
+                                              echo "In catch block while tagging SSHD image - ${e}"
+                                              throw e
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              post {
+                  always {
+                      script {
+                          openshift.withCluster() {
+                              openshift.withProject() {
+                                  def namespace   = "${openshift.project()}"
+                                  def postJobName = "${namespace}/${namespace}-post-triggers-jenkins-pipeline"
+                                  currentBuild.description = """
+                                  ${params.sshdRepo} ${params.sshdBranch} (try ${params.jobRetryCount}/${params.jobMaxRetry})
+                                  ${gitCommitMsg}
+                                  """.stripIndent()
+                                  echo "cleaning up assets for sshd-${params.sshdHash}"
+                                  sh "rm -fr /tmp/workspace/${namespace}/${namespace}-sshd-jenkins-pipeline/tmpsshd${params.sshdBranch}"
+                                  openshift.selector("buildconfigs", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                  openshift.selector("deploymentconfigs", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                  openshift.selector("configmaps", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                  openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.sshdHash}" ]).delete()
+                                  def jobParams = [
+                                          [$class: 'StringParameterValue', name: "jobMaxRetry", value: params.jobMaxRetry],
+                                          [$class: 'StringParameterValue', name: "jobRetryCount", value: params.jobRetryCount],
+                                          [$class: 'StringParameterValue', name: "jobStatus", value: currentBuild.currentResult],
+                                          [$class: 'StringParameterValue', name: "sourceBranch", value: params.sshdBranch],
+                                          [$class: 'StringParameterValue', name: "sourceComponent", value: "sshd"],
+                                          [$class: 'StringParameterValue', name: "sourceRef", value: params.sshdHash],
+                                          [$class: 'StringParameterValue', name: "sourceRepo", value: params.sshdRepo]
+                                      ]
+                                  try { build job: postJobName, parameters: jobParams, propagate: false, wait: false }
+                                  catch(e) { echo "caught ${e} starting Job post-process" }
+                              }
+                          }
+                      }
+                  }
+                  changed { echo "changed?" }
+                  failure { echo "Build failed (${params.jobRetryCount} out of ${params.jobMaxRetry})" }
+                  success { echo "success!" }
+                  unstable { echo "unstable?" }
+              }
+          }
+      type: JenkinsPipeline
+parameters:
+- name: GIT_SOURCE_HOST
+  description: Git FQDN we would build images from
+  displayName: Git
+  value: github.com

@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: sshd
+  template: sshd-buildconfig
+metadata:
+  annotations:
+    description: SSHD - BuildConfig
+      see https://github.com/faust64/docker-sshd
+    iconClass: icon-openshift
+    openshift.io/display-name: SSHD
+    tags: sshd
+  name: sshd-buildconfig
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Builds SSHD images
+    labels:
+      name: sshd-${SSHD_REPOSITORY_REF}
+    name: sshd-${SSHD_REPOSITORY_REF}
+  spec:
+    failedBuildsHistoryLimit: 1
+    resources:
+      limits:
+        cpu: 200m
+        memory: 512Mi
+    source:
+      contextDir: /
+      git:
+        uri: ${SSHD_REPOSITORY_URL}
+        ref: "${SSHD_REPOSITORY_REF}"
+      type: Git
+    strategy:
+      type: Docker
+      dockerStrategy:
+        env:
+        - name: DO_UPGRADE
+          value: foo
+        forcePull: false
+    output:
+      to:
+        kind: ImageStreamTag
+        name: sshd:${SSHD_REPOSITORY_REF}
+    triggers:
+    - type: ImageChange
+    - type: ConfigChange
+parameters:
+- name: SSHD_REPOSITORY_REF
+  description: Set this to a branch name, tag or other ref of your repository if you are not using the default branch
+  displayName: Git Reference
+  required: true
+  value: master
+- name: SSHD_REPOSITORY_URL
+  description: The URL of the repository with your SSHD Dockerfile
+  displayName: Git Repository URL
+  required: true
+  value: https://github.com/faust64/docker-sshd.git
